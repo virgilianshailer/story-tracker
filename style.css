@@ -88,8 +88,19 @@
     font-size:12px; font-weight:700; color:#ffa064; background:rgba(255,160,100,.05);
     border-bottom:1px solid rgba(255,160,100,.1);
 }
-.st-hud-body { padding:10px; max-height:60vh; overflow-y:auto; cursor:pointer;}
+.st-hud-body {
+    padding:10px; max-height:60vh; overflow-y:auto; cursor:pointer;
+    overscroll-behavior:contain;          /* keep wheel-scroll inside the widget */
+    scrollbar-width:thin;                  /* Firefox */
+    scrollbar-color:rgba(255,160,100,.4) transparent;
+}
 .st-hud-collapsed .st-hud-body { display:none; }
+
+/* Thin, themed scrollbar so it's clear the HUD can be scrolled on hover */
+.st-hud-body::-webkit-scrollbar { width:7px; }
+.st-hud-body::-webkit-scrollbar-track { background:transparent; }
+.st-hud-body::-webkit-scrollbar-thumb { background:rgba(255,160,100,.35); border-radius:4px; }
+.st-hud-body::-webkit-scrollbar-thumb:hover { background:rgba(255,160,100,.6); }
 
 .st-hud-row { font-size:11px; color:#ccc; margin-bottom:4px; }
 .st-hud-row strong { color:#ffa064; }
@@ -139,3 +150,38 @@
     font-size:11px; font-weight:700; color:#7ab8d4;
     margin-bottom:5px; display:flex; align-items:center; gap:5px;
 }
+/* ══════════════════════════════════════
+   CAMPAIGN THEME OVERRIDES
+   Active only while a Character Library campaign is running (that's what puts
+   data-rpg-lum on <html>). Standalone look is untouched — this block simply
+   doesn't match. The tracker's fixed orange is remapped onto the shared accent.
+   ══════════════════════════════════════ */
+html[data-rpg-lum] .st-dialog {
+    background: var(--rpg-panel, #141820);
+    border-color: var(--rpg-border, rgba(255,160,100,.2));
+    font-family: var(--rpg-font-ui, inherit);
+}
+html[data-rpg-lum] .st-header {
+    background: linear-gradient(135deg, var(--rpg-accent-soft, rgba(255,160,100,.08)), transparent);
+    border-bottom-color: var(--rpg-border, rgba(255,160,100,.15));
+}
+html[data-rpg-lum] .st-title,
+html[data-rpg-lum] .st-sec-title { color: var(--rpg-accent, #ffa064); font-family: var(--rpg-font-display, inherit); }
+html[data-rpg-lum] .st-tabs { border-bottom-color: var(--rpg-border, rgba(255,160,100,.1)); }
+html[data-rpg-lum] .st-tab:hover { background: var(--rpg-surface, rgba(255,160,100,.05)); }
+html[data-rpg-lum] .st-tab-active {
+    background: var(--rpg-accent-soft, rgba(255,160,100,.15)) !important;
+    color: var(--rpg-accent, #ffa064) !important;
+    border-bottom-color: var(--rpg-accent, #ffa064);
+}
+html[data-rpg-lum] .st-section {
+    background: var(--rpg-surface, rgba(255,255,255,.02));
+    border-color: var(--rpg-border, rgba(255,160,100,.1));
+}
+html[data-rpg-lum] .st-char-card { border-left-color: var(--rpg-accent, #ffa064); background: var(--rpg-surface, rgba(0,0,0,.15)); }
+html[data-rpg-lum] .st-char-name { color: var(--rpg-text-dim, #ccc); }
+html[data-rpg-lum] .st-char-state,
+html[data-rpg-lum] .st-item-val { color: var(--rpg-text, #eee); }
+html[data-rpg-lum] .st-item-label { color: var(--rpg-text-faint, inherit); }
+html[data-rpg-lum] .st-summary-box { border-left-color: var(--rpg-success, #4caf50); color: var(--rpg-text, #eee); }
+html[data-rpg-lum] .st-btn-tr-active { color: var(--rpg-accent-2, #ffda64) !important; border-color: var(--rpg-border-strong, rgba(255,218,100,.3)) !important; }

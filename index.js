@@ -7,21 +7,59 @@
 var MODULE = "story-tracker";
 var DATA_KEY = "story_tracker_data";
 
+// --- Scene-change broadcast (bridge to Lore Atlas & co) ---
+// Fire-and-forget event on ST's shared bus. Listeners are optional: the
+// tracker doesn't know or care whether Lore Atlas is installed.
+var ST_SCENE_EVENT = "story_tracker_scene_change";
+var lastSceneEmit = { chatId: "", idx: -1 };
+
 // --- Prompts ---
-var UPDATE_PROMPT = 
+var UPDATE_PROMPT_BASE =
     "[OOC: You are a narrative assistant. Analyze the roleplay chat so far and determine the current scene context.\n\n" +
-    "1. TIMELINE & LOCATION: Deduce the current Time (HH:MM), Date (DD/MM/YYYY or similar format), specific Location, current Temperature (e.g. '18°C' or '64°F'), and Weather conditions (e.g. 'Clear', 'Rainy', 'Overcast', 'Snowing', 'Stormy', 'Hot', 'Foggy'). If indoors or weather is unspecified, infer from context or write 'Unknown'. Time MUST progress logically based on recent actions.\n" +
-    "2. CITY & COUNTRY — MANDATORY, NEVER USE 'Unknown': You MUST always fill both 'city' and 'country' fields with a real or invented name. Rules:\n" +
+    "1. TIME & CONDITIONS: Deduce the current Time (HH:MM), specific Location, current Temperature (e.g. '18°C' or '64°F'), and Weather conditions (e.g. 'Clear', 'Rainy', 'Overcast', 'Snowing', 'Stormy', 'Hot', 'Foggy'). If indoors or weather is unspecified, infer from context or write 'Unknown' for temperature/weather only. Time MUST progress logically based on recent actions.\n" +
+    "2. DATE & DAY OF WEEK — MANDATORY, NEVER USE 'Unknown': You MUST always fill both 'date' and 'day_of_week'. Rules:\n" +
+    "   - 'date': use DD/MM/YYYY for a real or clearly-numbered calendar; otherwise invent a fitting date in the story's own calendar (e.g. '3rd of Frostmoon, Year 1245').\n" +
+    "   - 'day_of_week': the name of the weekday for that date. Use real weekday names (Monday…Sunday) unless the story has already established its own named days — then use those.\n" +
+    "   - A scene that feels outside normal time (dreams, liminal spaces, a place seemingly outside time, etc.) still gets a date and a day name — invent one that fits the mood. 'Unknown' is NOT an acceptable value under any circumstances for either field.\n" +
+    "3. CITY & COUNTRY — MANDATORY, NEVER USE 'Unknown': You MUST always fill both 'city' and 'country' fields with a real or invented name. Rules:\n" +
     "   - Real-world setting → use the actual city and country (e.g. 'Paris' / 'France').\n" +
     "   - Fantasy / sci-fi / fictional world → INVENT fitting names based on the story tone, character names, culture, architecture, language style. Be creative and specific (e.g. 'Myrenveld' / 'Sovereign Realms of Drak'hara').\n" +
     "   - Known fictional universe (Westeros, Middle-earth, etc.) → use canonical place names.\n" +
     "   - Setting is ambiguous or unspecified → make your BEST GUESS or freely invent. 'Unknown' is NOT an acceptable value under any circumstances.\n" +
-    "3. CHARACTER POSITIONS: List every character present in the current scene (including {{user}} / the user). State exactly where they are and what their physical posture/action is right now (e.g., 'sitting on the bed', 'standing near the window', 'holding a knife').\n" +
-    "4. RECENT EVENTS: Write a brief, factual 1-2 sentence summary of what *just* changed or happened in the last few messages (e.g., 'User picked up a fork. Character 1 moved to the corridor.').\n\n" +
-    "{{PREVIOUS_STATE}}\n\n" +
-    "Respond ONLY with valid JSON in the story's language. Use this exact structure (city and country MUST be non-empty strings, never 'Unknown'):\n" +
-    "{\"time\":\"14:30\", \"date\":\"15/06/2024\", \"location\":\"Living room\", \"city\":\"Myrenveld\", \"country\":\"Sovereign Realms of Drak'hara\", \"temperature\":\"18°C\", \"weather\":\"Cloudy\", \"characters\":[{\"name\":\"User\", \"state\":\"sitting on floor\"}, {\"name\":\"Char1\", \"state\":\"standing near User\"}], \"recent_events\":\"Char1 entered the living room and spoke to User.\"}\n" +
-    "]";
+    "4. CHARACTER POSITIONS: List every character present in the current scene (including {{user}} / the user). State exactly where they are and what their physical posture/action is right now (e.g., 'sitting on the bed', 'standing near the window', 'holding a knife').\n" +
+    "   IDENTITY — ONE PERSON, ONE ENTRY. The list below of who was tracked last turn may name people by ROLE because the story had not named them yet ('the secretary', 'the guard', 'a hooded man'). The moment the story gives that person a name, use the NAME and drop the role entry: they are the same person, and listing both would put two people in the room where there is one. When a name is listed under KNOWN CHARACTER CARDS, spell it exactly as it appears there.\n" +
+    "5. RECENT EVENTS: Write a brief, factual 1-2 sentence summary of what *just* changed or happened in the last few messages (e.g., 'User picked up a fork. Character 1 moved to the corridor.').\n";
+
+// Builds the CUSTOM FIELDS instruction block + the "custom" part of the JSON example,
+// based on the user-defined tracking parameters in settings.customFields.
+function buildCustomFieldsPromptParts() {
+    var fields = (settings.customFields || []).filter(function (f) { return f && f.label; });
+    if (fields.length === 0) return { instructions: "", jsonExample: "" };
+
+    var lines = fields.map(function (f, i) {
+        var hint = f.hint ? " — " + f.hint : "";
+        return "   - \"" + f.id + "\" (" + f.label + ")" + hint + ": for EACH character present, give a short current value for this parameter.";
+    });
+    var instructions =
+        "6. CUSTOM TRACKED PARAMETERS: In addition to the above, track these user-defined parameters PER CHARACTER (including {{user}} if relevant), updating them based on what has happened so far:\n" +
+        lines.join("\n") + "\n" +
+        "   Keep each value short (a few words). If a parameter doesn't apply to a character, use 'N/A'.\n";
+
+    var exampleEntries = fields.map(function (f) { return "\"" + f.id + "\":\"" + f.label + " value\""; }).join(", ");
+    var jsonExample = ", \"custom\":{\"User\":{" + exampleEntries + "}, \"Char1\":{" + exampleEntries + "}}";
+
+    return { instructions: instructions, jsonExample: jsonExample };
+}
+
+function buildUpdatePrompt() {
+    var custom = buildCustomFieldsPromptParts();
+    var prompt = UPDATE_PROMPT_BASE + custom.instructions + "\n" +
+        "{{PREVIOUS_STATE}}\n\n" +
+        "Respond ONLY with valid JSON in the story's language. Use this exact structure (date, day_of_week, city and country MUST be non-empty strings, never 'Unknown'):\n" +
+        "{\"time\":\"14:30\", \"date\":\"15/06/2024\", \"day_of_week\":\"Saturday\", \"location\":\"Living room\", \"city\":\"Myrenveld\", \"country\":\"Sovereign Realms of Drak'hara\", \"temperature\":\"18°C\", \"weather\":\"Cloudy\", \"characters\":[{\"name\":\"User\", \"state\":\"sitting on floor\"}, {\"name\":\"Char1\", \"state\":\"standing near User\"}], \"recent_events\":\"Char1 entered the living room and spoke to User.\"" + custom.jsonExample + "}\n" +
+        "]";
+    return prompt;
+}
 
 // Fallback prompt — used when city/country is still unknown after main update
 var CITY_COUNTRY_PROMPT =
@@ -47,6 +85,10 @@ var settings = {
     injectToContext: true,
     showHistory: true,
     showCityCountry: false,
+    // --- Custom tracking fields (user-defined parameters, e.g. "Emotional State", "Growth Level") ---
+    customFields: [], // [{id, label, hint}]
+    customFieldPresets: [], // [{name, fields:[{id,label,hint}]}] — saved sets of custom fields, reusable across chats
+    broadcastScene: true, // emit scene-change events for other extensions (Lore Atlas bridge)
     // --- Connection profile support ---
     useConnectionProfile: false, // master toggle: route Story Tracker analysis through a separate profile
     connectionProfile: "",       // name of the profile to use (empty = current/main profile)
@@ -62,9 +104,16 @@ var busy = false;
 jQuery(async function () {
     try {
         var m = await import("../../../extensions.js");
-        extSettings = m.extension_settings; saveFn = m.saveSettingsDebounced;
+        extSettings = m.extension_settings;
         scriptModule = await import("../../../../script.js");
         if (typeof scriptModule.generateQuietPrompt === "function") genQuiet = scriptModule.generateQuietPrompt;
+        /* extensions.js IMPORTS saveSettingsDebounced without re-exporting it —
+           its only `export {}` block carries getContext, getApiUrl and
+           SimpleMutex. Reading it there left save() a reader with no writer
+           (§6.3). Context object first, script.js as the fallback. */
+        try { var c = SillyTavern.getContext(); if (c && typeof c.saveSettingsDebounced === "function") saveFn = c.saveSettingsDebounced; } catch (eCtx) { }
+        if (typeof saveFn !== "function" && typeof scriptModule.saveSettingsDebounced === "function") saveFn = scriptModule.saveSettingsDebounced;
+        if (typeof saveFn !== "function") console.error("[Story Tracker] saveSettingsDebounced unavailable on both getContext() and script.js — settings will NOT persist");
 
         // Optional: slash-command runner, needed to switch connection profiles.
         // Wrapped in its own try so a path change in ST never breaks the whole extension.
@@ -81,6 +130,8 @@ jQuery(async function () {
         buildSettingsPanel();
         buildChatButton();
         bindEvents();
+        installStoryTrackerApi();
+        stBindLangSwitch();          // §9.2
 
         // Safety net: restore the main profile if a previous analysis was interrupted
         // by a page reload. Runs after a short delay so Connection Manager finishes loading.
@@ -99,14 +150,20 @@ function loadSettings() {
     }
 }
 
-function save() { if(saveFn) saveFn(); }
+/* One warning per session, not per call. */
+var saveMissingWarned = false;
+function save() {
+    if (saveFn) { saveFn(); return; }
+    if (!saveMissingWarned) { saveMissingWarned = true; console.error("[Story Tracker] save(): no saveSettingsDebounced — settings changes are being dropped"); }
+}
 
 function makeDefaultData() {
     return {
-        time: "--:--", date: "Unknown", location: "Unknown",
+        time: "--:--", date: "Unknown", day_of_week: "Unknown", location: "Unknown",
         city: "Unknown", country: "Unknown",
         temperature: "Unknown", weather: "Unknown",
         characters: [], recent_events: "Story just started.",
+        custom: {},
         history: [], _initialized: false, _msgCount: 0
     };
 }
@@ -118,6 +175,7 @@ function loadStoryData() {
         storyData = stored;
         msgCounter = storyData._msgCount || 0;
         if (!storyData.history) storyData.history = [];
+        if (!storyData.custom || typeof storyData.custom !== "object") storyData.custom = {};
     } else {
         storyData = makeDefaultData();
         if (meta) meta[DATA_KEY] = storyData;
@@ -160,6 +218,40 @@ function populateProfileDropdown() {
 
 
 // --- LLM Logic ---
+/* Names of the cards actually in this chat: the solo character, or every member
+   of the group. Location and narrator cards are left out — Character Creator
+   saves those as cards too, and a place is not one of the people in the room. */
+function knownCardNames() {
+    var out = [];
+    try {
+        var ctx = (typeof SillyTavern !== "undefined" && SillyTavern.getContext) ? SillyTavern.getContext() : null;
+        if (!ctx) return out;
+        function kindOf(card) {
+            var d = (card && card.data) ? card.data : (card || {});
+            var ext = (d.extensions && d.extensions.character_creator) ||
+                (card && card.extensions && card.extensions.character_creator);
+            if (!ext) return "character";
+            var data = ext.data || ext;
+            var t = data && data.cardType;
+            return (t === "location" || t === "narrator") ? t : "character";
+        }
+        function push(c) {
+            if (c && c.name && kindOf(c) === "character" && out.indexOf(c.name) < 0) out.push(c.name);
+        }
+        if (ctx.groupId && Array.isArray(ctx.groups)) {
+            var g = ctx.groups.find(function (x) { return x.id === ctx.groupId; });
+            if (g && Array.isArray(g.members) && Array.isArray(ctx.characters)) {
+                g.members.forEach(function (mid) {
+                    push(ctx.characters.find(function (c) { return c.avatar === mid; }));
+                });
+            }
+        } else if (ctx.characterId !== undefined && ctx.characters && ctx.characters[ctx.characterId]) {
+            push(ctx.characters[ctx.characterId]);
+        }
+    } catch (e) { }
+    return out;
+}
+
 function buildPrevStateText() {
     if (!storyData || !storyData._initialized) return "This is the INITIAL setup. Deduce starting parameters from the intro message.";
     let s = "PREVIOUS STATE:\nTime: " + storyData.time + " | Date: " + storyData.date + " | Location: " + (storyData._origLocation || storyData.location) + "\n";
@@ -176,7 +268,35 @@ function buildPrevStateText() {
         s += "Items held by character: " + charHeld + "\n";
     }
 
-    return s + "(Update the time, check if location/weather changed, update character positions based on what they just did).";
+    var prevCustom = (storyData._origCustom || storyData.custom);
+    if (prevCustom && Object.keys(prevCustom).length > 0 && settings.customFields && settings.customFields.length > 0) {
+        s += "Previous custom tracked values: " + JSON.stringify(prevCustom) + "\n";
+    }
+
+    /* CONTINUITY OF IDENTITY.
+       Everything else here carried over between turns — time, weather, outfit,
+       custom fields — but the cast did not: the roster was re-derived from
+       scratch every turn with nothing to tie it to the previous one. So when
+       the story finally named the person it had been calling "the secretary",
+       the next pass had no way to know it was her, and the tracker ended up
+       holding two people where there was one. (Story Predictor makes this
+       visible rather than causing it: it offers a card for the newly named
+       NPC, and the duplicate is then staring at you from the panel.)
+       Two lists, because they answer different questions: who WE were tracking,
+       and who has a card — a card name is the spelling everything else in the
+       stack keys on. */
+    var prevChars = (storyData._origCharacters || storyData.characters || [])
+        .map(function (c) { return c && c.name; })
+        .filter(Boolean);
+    if (prevChars.length) {
+        s += "Characters tracked last turn (some may be named by ROLE, not by name): " + prevChars.join(", ") + "\n";
+    }
+    var cards = knownCardNames();
+    if (cards.length) {
+        s += "KNOWN CHARACTER CARDS (use these spellings): " + cards.join(", ") + "\n";
+    }
+
+    return s + "(Update the time, check if location/weather changed, update character positions based on what they just did. If someone tracked by role now has a name, keep ONE entry under the name.)";
 }
 
 // --- Connection Profile Support ---
@@ -276,6 +396,39 @@ async function recoverProfileIfNeeded() {
 }
 
 
+/* Does a host already own this turn's scene? True only when the Game Shell is
+   up AND the active mode's turn contract carries `scene_state` — that is the
+   exact condition under which the Shell asks the main generation for the scene
+   and hands it here through StoryTrackerAPI.applyScene. Reads facts the
+   conductor already publishes; introduces no flag of its own (§6.3). */
+function stHostDrivesScene() {
+    try {
+        if (typeof window === "undefined" || !window.RPGShellOpen) return false;
+        var M = window.ShellModes;
+        if (!M || typeof M.turnFields !== "function") return false;
+        var f = M.turnFields();
+        return Array.isArray(f) && f.indexOf("scene_state") !== -1;
+    } catch (e) { return false; }
+}
+
+/* K1 (Academy, CONCEPT-academy-mode.md §2.4): does a host own the game CLOCK?
+   True when the Shell is up and the active mode's turn contract carries
+   `clock` — the academy clock then mirrors its time in through
+   applyScene({time}), and this pass must not overwrite it with its own
+   analysis (that would be the two-writers-of-time bug, §6.5).
+   A FIELD gate, not a return gate: under the vn chassis this pass is the only
+   scene tracker, so weather, positions, city/country and the rest stay live —
+   only the `time` assignment steps aside. */
+function stHostDrivesTime() {
+    try {
+        if (typeof window === "undefined" || !window.RPGShellOpen) return false;
+        var M = window.ShellModes;
+        if (!M || typeof M.turnFields !== "function") return false;
+        var f = M.turnFields();
+        return Array.isArray(f) && f.indexOf("clock") !== -1;
+    } catch (e) { return false; }
+}
+
 async function doLLMUpdate() {
     if (!genQuiet) throw new Error("LLM generation not available.");
 
@@ -283,12 +436,20 @@ async function doLLMUpdate() {
     let wasTr = storyData._translated;
     if (wasTr) untranslateData();
 
-    var prompt = UPDATE_PROMPT.replace("{{PREVIOUS_STATE}}", buildPrevStateText());
+    // Snapshot BEFORE applying the new analysis — the scene-change broadcast
+    // compares old vs new location/date (untranslated values on both sides).
+    var prevScene = {
+        initialized: !!storyData._initialized,
+        location: storyData.location,
+        date: storyData.date
+    };
+
+    var prompt = buildUpdatePrompt().replace("{{PREVIOUS_STATE}}", buildPrevStateText());
 
     console.log("[Story Tracker] Analyzing scene...");
     // Route the scene analysis through the configured connection profile (if any),
     // then automatically restore the user's main profile when done.
-    var raw = await withConnectionProfile(function () { return genQuiet(prompt); });
+    var raw = await withConnectionProfile(function () { return genQuiet({ quietPrompt: prompt }); });
 
     // Parse JSON safely
     var data = null;
@@ -301,7 +462,9 @@ async function doLLMUpdate() {
     if (!data || !data.time) throw new Error("Failed to parse LLM response.");
 
     // Apply data
-    storyData.time = data.time || storyData.time;
+    /* K1: when a host clock owns the time (academy mode), the analysis keeps
+       every other field but must not overwrite the mirrored time string. */
+    if (!stHostDrivesTime()) storyData.time = data.time || storyData.time;
     storyData.date = data.date || storyData.date;
     storyData.location = data.location || storyData.location;
 
@@ -310,18 +473,37 @@ async function doLLMUpdate() {
     storyData.city    = !isBlank(data.city)    ? data.city    : (isBlank(storyData.city)    ? null : storyData.city);
     storyData.country = !isBlank(data.country) ? data.country : (isBlank(storyData.country) ? null : storyData.country);
 
+    // Day of week is now mandatory from the model (same "never Unknown" contract as
+    // city/country). No second fallback call, though: unlike an invented place name,
+    // a missing weekday can be recovered for free from the date client-side below.
+    storyData.day_of_week = !isBlank(data.day_of_week) ? data.day_of_week : (isBlank(storyData.day_of_week) ? null : storyData.day_of_week);
+
     storyData.temperature = data.temperature || storyData.temperature;
     storyData.weather = data.weather || storyData.weather;
     storyData.characters = Array.isArray(data.characters) ? data.characters : [];
     storyData.recent_events = data.recent_events || "";
+    storyData.custom = (data.custom && typeof data.custom === "object") ? data.custom : {};
     storyData._initialized = true;
 
-    // Fallback: if city or country still missing, ask LLM specifically for them
-    if (settings.showCityCountry && (isBlank(storyData.city) || isBlank(storyData.country))) {
+    /* Fallback: if city or country is still missing, ask the LLM for them —
+       ONCE PER LOCATION.
+       Reported 2026-08-02 as "two identical LLM calls per update". It was not a
+       double event (that was fixed by binding one) — doLLMUpdate itself makes a
+       SECOND call here, and in an invented world it made it forever: a fictional
+       street has no real city, the model keeps answering "Unknown", the blank
+       test keeps passing, and the next update asks the very same question about
+       the very same place. A negative answer has to be REMEMBERED, or a retry
+       loop with no exit is what "just a fallback" turns into.
+       The memo rides in storyData (chat metadata), so it survives a reload; a
+       genuine move produces a different key and asks again exactly once. */
+    var ccKey = String(storyData._origLocation || storyData.location || "Unknown");
+    if (settings.showCityCountry && (isBlank(storyData.city) || isBlank(storyData.country))
+        && storyData._ccAsked !== ccKey) {
+        storyData._ccAsked = ccKey;
         try {
             console.log("[Story Tracker] City/country missing — running fallback inference...");
-            var ccPrompt = CITY_COUNTRY_PROMPT.replace("{{LOCATION}}", storyData._origLocation || storyData.location || "Unknown");
-            var ccRaw = await withConnectionProfile(function () { return genQuiet(ccPrompt); });
+            var ccPrompt = CITY_COUNTRY_PROMPT.replace("{{LOCATION}}", ccKey);
+            var ccRaw = await withConnectionProfile(function () { return genQuiet({ quietPrompt: ccPrompt }); });
             var ccData = null;
             try { ccData = JSON.parse(ccRaw); }
             catch(e) { var cm = ccRaw.match(/\{[\s\S]*?\}/); if (cm) { try { ccData = JSON.parse(cm[0]); } catch(ex){} } }
@@ -335,6 +517,10 @@ async function doLLMUpdate() {
     // Ensure display-safe values
     if (isBlank(storyData.city))    storyData.city    = "Unknown";
     if (isBlank(storyData.country)) storyData.country = "Unknown";
+    // Day of week: model output wins; if it's still missing (old save, or a model
+    // that ignored the instruction), derive it from the date instead of showing
+    // "Unknown" — only a date that itself can't be parsed falls through to that.
+    if (isBlank(storyData.day_of_week)) storyData.day_of_week = getDayOfWeek(storyData.date) || "Unknown";
 
     // Save to history (keep last 20)
     storyData.history.unshift({
@@ -344,14 +530,61 @@ async function doLLMUpdate() {
         temperature: storyData.temperature,
         weather: storyData.weather,
         events: storyData.recent_events,
-        chars: JSON.parse(JSON.stringify(storyData.characters))
+        chars: JSON.parse(JSON.stringify(storyData.characters)),
+        custom: JSON.parse(JSON.stringify(storyData.custom || {}))
     });
     if (storyData.history.length > 20) storyData.history.pop();
 
     saveStoryData();
     syncToCharTracker(); // Sync data with Character Tracker
 
+    // Broadcast while the data is still untranslated, so listeners get the
+    // same strings the lorebooks use.
+    maybeEmitSceneChange(prevScene);
+
     if (wasTr) await translateData();
+}
+
+// Emits ST_SCENE_EVENT when an analysis shows the scene moved (location
+// changed → 'scene') or time jumped (date changed → 'timeskip').
+// messageIndex is the index at DETECTION time: the tracker notices a change
+// after the fact, so this is an upper bound for the finished scene, not an
+// exact boundary. Listeners treat it as the top of their sync window.
+function maybeEmitSceneChange(prev) {
+    try {
+        if (!settings.broadcastScene) return;
+        if (window._laOwnGeneration) return;   // never react to Lore Atlas' own quiet prompts
+        if (!prev.initialized) return;         // first analysis of a chat is setup, not a change
+        var known = function (v) { return v && String(v).trim() && String(v).trim().toLowerCase() !== "unknown"; };
+        var newLoc = storyData.location, newDate = storyData.date;
+        var locChanged = known(prev.location) && known(newLoc) && prev.location.trim().toLowerCase() !== newLoc.trim().toLowerCase();
+        var dateChanged = known(prev.date) && known(newDate) && prev.date.trim() !== newDate.trim();
+        if (!locChanged && !dateChanged) return;
+
+        var ctx = SillyTavern.getContext();
+        var chatId = String((ctx.getCurrentChatId && ctx.getCurrentChatId()) || "");
+        var idx = (scriptModule.chat ? scriptModule.chat.length : 0) - 1;
+        if (!chatId || idx < 0) return;
+        if (lastSceneEmit.chatId === chatId && lastSceneEmit.idx === idx) return;  // dedup
+        lastSceneEmit = { chatId: chatId, idx: idx };
+
+        var payload = {
+            version: 1,
+            source: "story-tracker",
+            reason: locChanged ? "scene" : "timeskip",
+            chatId: chatId,
+            messageIndex: idx,
+            scene: {
+                location: known(newLoc) ? newLoc : "",
+                locationPath: [storyData.country, storyData.city, newLoc].filter(known),
+                participants: (storyData.characters || []).map(function (c) { return c && c.name; }).filter(Boolean),
+                summary: storyData.recent_events || "",
+                deltaLines: []
+            }
+        };
+        ctx.eventSource.emit(ST_SCENE_EVENT, payload);
+        console.log("[Story Tracker] Scene change broadcast:", payload.reason, payload.scene.location);
+    } catch (e) { console.warn("[Story Tracker] Scene broadcast failed:", e); }
 }
 
 // --- Sync to Character Tracker ---
@@ -441,8 +674,21 @@ function getInventoryOutfit() {
 }
 
 // --- Context Injection ---
+var ST_INJECT_KEY = "STORY_TRACKER_SCENE";
+function stInjectPos() { return (scriptModule && scriptModule.extension_prompt_types) ? scriptModule.extension_prompt_types.IN_CHAT : 1; }
+function stSetInject(text) { try { if (scriptModule && typeof scriptModule.setExtensionPrompt === "function") scriptModule.setExtensionPrompt(ST_INJECT_KEY, text, stInjectPos(), 1, false); } catch (e) { console.error("[Story Tracker] Inject error:", e); } }
+
 function injectContextToChat() {
-    if (!settings.enabled || !settings.injectToContext || !storyData || !storyData._initialized) return;
+    if (!settings.enabled || !settings.injectToContext || !storyData || !storyData._initialized) { stSetInject(""); return; }
+    /* Game Shell §10 C4: while the Shell speaks for the ecosystem, its state
+       digest (ZZ_GM_STATE) already carries every field this block prints —
+       location, time, weather, positions, recent events, outfit, custom
+       parameters — so injecting them again is the same facts twice.
+       WE STILL COMPUTE THE SCENE: only the injection goes quiet. The digest
+       reads it through StoryTrackerAPI.getScene(), so muting the calculation
+       would blank the very thing that replaced us. The flag is lowered the
+       moment the Shell closes, and standalone use is untouched. */
+    if (typeof window !== "undefined" && window.RPGShellOwnsContext) { stSetInject(""); return; }
     
     // Always inject original (untranslated) data to LLM
     let loc = storyData._origLocation || storyData.location;
@@ -475,14 +721,31 @@ function injectContextToChat() {
         var charHeldStr = outfit.charItems.map(function(ci) { return ci.name + " (held by " + ci.heldBy + ")"; }).join(", ");
         inj += `\nCharacter holds: ${charHeldStr}`;
     }
+
+    // Append custom tracked parameters (e.g. emotional state, growth level), if any are configured
+    if (settings.customFields && settings.customFields.length > 0) {
+        var origCustom = storyData._origCustom || storyData.custom;
+        if (origCustom && Object.keys(origCustom).length > 0) {
+            var fieldLabels = {};
+            settings.customFields.forEach(function (f) { fieldLabels[f.id] = f.label; });
+            var customLines = [];
+            for (var charName in origCustom) {
+                var vals = origCustom[charName];
+                if (!vals || typeof vals !== "object") continue;
+                var parts = Object.keys(vals).map(function (k) { return (fieldLabels[k] || k) + ": " + vals[k]; });
+                if (parts.length > 0) customLines.push(charName + " — " + parts.join(", "));
+            }
+            if (customLines.length > 0) inj += `\nTracked Parameters: ${customLines.join(" | ")}`;
+        }
+    }
+
     inj += `]`;
     
-    try {
-        var ex = scriptModule.chat_metadata.authorsNote || "";
-        var mk = "<!-- ST_INJECT -->", emk = "<!-- /ST_INJECT -->";
-        var cl = ex.replace(new RegExp(mk + "[\\s\\S]*?" + emk, "g"), "").trim();
-        scriptModule.chat_metadata.authorsNote = cl + (cl ? "\n" : "") + mk + "\n" + inj + "\n" + emk;
-    } catch(e) { console.error("[Story Tracker] Inject error:", e); }
+    // Inject via the proper extension-prompt channel. The old build wrote into
+    // chat_metadata.authorsNote — a key SillyTavern never reads (the author's note
+    // lives in note_prompt), so the tracked scene context never reached the model.
+    var mk = "<!-- ST_INJECT -->", emk = "<!-- /ST_INJECT -->";
+    stSetInject(mk + "\n" + inj + "\n" + emk);
 }
 
 // --- Event Handling ---
@@ -509,6 +772,25 @@ function bindEvents() {
     });
 
     let handleMsg = async function() {
+        if (window._laOwnGeneration) return;   // Lore Atlas background prompt — not story content
+        /* GM Turn (§9.1): the Game Shell already got this turn's scene out of
+           the MAIN generation and applies it through StoryTrackerAPI. The flag
+           is only up while a block actually arrived — a turn without one
+           releases it before this handler runs, so nothing is starved. */
+        if (window.RPGShellDriving) return;
+        /* ...and stand down for as long as the Shell is up IF its mode actually
+           carries the scene. RPGShellDriving is raised only around the Shell's
+           own satellite jobs, so between turns this pass still ran a full paid
+           analysis of a message the host had already analysed and applied
+           through StoryTrackerAPI.applyScene — the §10 note "story-tracker goes
+           quiet under the Shell" described an intention the guard never
+           implemented.
+           The gate is deliberately NOT "the Shell is open": the vn and pnc
+           chassis DROP scene_state from the contract, so in a Visual Novel or a
+           Journey this extension is the only thing tracking time and place, and
+           silencing it there would take the tracking away instead of
+           deduplicating it. */
+        if (stHostDrivesScene()) return;
         if (!settings.enabled || busy) return;
         msgCounter++;
         saveStoryData();
@@ -528,8 +810,12 @@ function bindEvents() {
         }
     };
 
+    // Bind to ONE message event only. eventSource.emit awaits each handler, so
+    // MESSAGE_RECEIVED's handleMsg finishes doLLMUpdate and clears `busy` BEFORE
+    // CHARACTER_MESSAGE_RENDERED fires — the busy guard can't dedupe across two
+    // events, so binding both ran the whole analysis twice (2 events × up to 2
+    // LLM calls = 4 requests per turn).
     es.on(et.CHARACTER_MESSAGE_RENDERED, handleMsg);
-    es.on(et.MESSAGE_RECEIVED, handleMsg);
     es.on(et.GENERATION_STARTED, function() { injectContextToChat(); });
 }
 
@@ -553,6 +839,7 @@ function buildModal() {
     var h = '<div id="st-modal" style="display:none"><div class="st-overlay"></div><div class="st-dialog">';
     h += '<div class="st-header"><div class="st-title"><i class="fa-solid fa-book-open-reader"></i> Story Tracker</div>';
     h += '<div class="st-header-right">';
+    h += '<button class="st-hdr-btn menu_button" id="st-h-atlas" title="Open current location in Lore Atlas"><i class="fa-solid fa-diagram-project"></i></button>';
     h += '<button class="st-hdr-btn menu_button" id="st-h-translate" title="Translate"><i class="fa-solid fa-language"></i></button>';
     h += '<button class="st-hdr-btn menu_button" id="st-h-refresh" title="Force Update"><i class="fa-solid fa-rotate"></i></button>';
     h += '<button class="st-hdr-btn menu_button" id="st-h-close" title="Close"><i class="fa-solid fa-xmark"></i></button>';
@@ -575,6 +862,7 @@ function buildModal() {
     h += '</div></div>';
     
     h += '<div class="st-section"><div class="st-sec-title"><i class="fa-solid fa-users"></i> Character Positions</div><div class="st-char-list" id="st-val-chars"></div></div>';
+    h += '<div class="st-section" id="st-custom-section" style="display:none"><div class="st-sec-title"><i class="fa-solid fa-sliders"></i> Custom Tracking</div><div class="st-char-list" id="st-val-custom"></div></div>';
     h += '<div class="st-section"><div class="st-sec-title"><i class="fa-solid fa-scroll"></i> Recent Events (Summary)</div><div class="st-summary-box" id="st-val-events"></div></div>';
     h += '</div></div>'; // end tab 1
     
@@ -588,6 +876,16 @@ function buildModal() {
     $(document).on("click", ".st-overlay, #st-h-close", function() { $("#st-modal").fadeOut(150); });
     $(document).on("click", "#st-h-refresh, #st-f-update", doManualUpdate);
     $(document).on("click", "#st-h-translate", doTranslateToggle);
+    // Manual bridge: jump to the current location's book in Lore Atlas (if installed)
+    $(document).on("click", "#st-h-atlas", function() {
+        var la = window.LoreAtlas;
+        if (!la) { if (typeof toastr !== "undefined") toastr.warning("Lore Atlas is not installed."); return; }
+        var loc = storyData ? (storyData._origLocation || storyData.location || "") : "";
+        var book = (typeof la.resolveLocation === "function") ? la.resolveLocation(loc) : null;
+        $("#st-modal").fadeOut(150);
+        if (book && typeof la.openBook === "function") la.openBook(book);
+        else la.open();
+    });
     $(document).on("click", ".st-tab", function() {
         $(".st-tab").removeClass("st-tab-active"); $(this).addClass("st-tab-active");
         $("#st-tab-current, #st-tab-history").hide();
@@ -603,7 +901,7 @@ function renderModal() {
         $("#st-no-data").hide(); $("#st-content-area").show();
         $("#st-val-time").text(storyData.time);
         $("#st-val-date").text(storyData.date);
-        var dow = getDayOfWeek(storyData.date);
+        var dow = (storyData.day_of_week && storyData.day_of_week !== "Unknown") ? storyData.day_of_week : getDayOfWeek(storyData.date);
         $("#st-val-dow").text(dow || "Unknown");
         $("#st-val-loc").text(storyData.location);
         
@@ -657,16 +955,50 @@ function renderModal() {
             });
         }
         $("#st-val-chars").html(cHtml || "<i>No characters detected.</i>");
+
+        // Custom Tracking section
+        if (settings.customFields && settings.customFields.length > 0) {
+            var fieldLabels = {};
+            settings.customFields.forEach(function (f) { fieldLabels[f.id] = f.label; });
+            var custHtml = "";
+            var custData = storyData.custom || {};
+            Object.keys(custData).forEach(function (charName) {
+                var vals = custData[charName];
+                if (!vals || typeof vals !== "object") return;
+                var rows = Object.keys(vals).map(function (k) {
+                    return '<div><span style="opacity:.6">' + esc(fieldLabels[k] || k) + ':</span> ' + esc(String(vals[k])) + '</div>';
+                }).join("");
+                if (rows) custHtml += '<div class="st-char-card"><div class="st-char-name">' + esc(charName) + '</div><div class="st-char-state">' + rows + '</div></div>';
+            });
+            $("#st-val-custom").html(custHtml || "<i>No data yet.</i>");
+            $("#st-custom-section").show();
+        } else {
+            $("#st-custom-section").hide();
+        }
     }   // end storyData._initialized else block
     
     // History render
     let hHtml = "";
     if (storyData.history && storyData.history.length > 0) {
+        var fieldLabelsH = {};
+        (settings.customFields || []).forEach(function (f) { fieldLabelsH[f.id] = f.label; });
         storyData.history.forEach((h, i) => {
             let weatherInfo = (h.temperature || h.weather) ? ` | ${h.temperature || ""}${h.weather ? " " + esc(h.weather) : ""}` : "";
+            let customLine = "";
+            if (h.custom && Object.keys(h.custom).length > 0 && settings.customFields && settings.customFields.length > 0) {
+                let bits = [];
+                Object.keys(h.custom).forEach(function (charName) {
+                    var vals = h.custom[charName];
+                    if (!vals || typeof vals !== "object") return;
+                    var parts = Object.keys(vals).map(function (k) { return (fieldLabelsH[k] || k) + ": " + vals[k]; });
+                    if (parts.length > 0) bits.push(charName + " (" + parts.join(", ") + ")");
+                });
+                if (bits.length > 0) customLine = `<div class="st-history-sum" style="opacity:.6;margin-top:3px;">${esc(bits.join(" | "))}</div>`;
+            }
             hHtml += `<div class="st-history-item">
                 <div class="st-history-meta"><span>Update at Msg #${h.msg}</span><span>${h.time} | ${esc(h.loc)}${weatherInfo}</span></div>
                 <div class="st-history-sum">${esc(h.events)}</div>
+                ${customLine}
             </div>`;
         });
     } else { hHtml = "<div class='st-no-data'>No history yet.</div>"; }
@@ -728,8 +1060,8 @@ function renderHUD() {
     if (!storyData || !storyData._initialized) {
         $("#st-hud-body").html("<div style='text-align:center;opacity:.5;font-size:10px;'>Waiting...</div>"); return;
     }
-    let dow = getDayOfWeek(storyData.date);
-    let dowStr = dow ? ` &nbsp;<i class="fa-solid fa-calendar-day"></i> ${dow}` : "";
+    let dow = (storyData.day_of_week && storyData.day_of_week !== "Unknown") ? storyData.day_of_week : getDayOfWeek(storyData.date);
+    let dowStr = ` &nbsp;<i class="fa-solid fa-calendar-day"></i> ${dow || "Unknown"}`;
     let h = `<div class="st-hud-row"><i class="fa-solid fa-clock"></i> <strong>${storyData.time}</strong> &nbsp; <i class="fa-solid fa-calendar"></i> ${storyData.date}${dowStr}</div>`;
     h += `<div class="st-hud-row"><i class="fa-solid fa-location-dot"></i> ${esc(storyData.location)}</div>`;
     if (settings.showCityCountry) {
@@ -758,7 +1090,7 @@ function renderHUD() {
     var hudUserName = (scriptModule && scriptModule.name1) ? scriptModule.name1 : null;
 
     if (storyData.characters) {
-        storyData.characters.slice(0, 3).forEach(c => {
+        storyData.characters.forEach(c => {
             var hudStateText = c.state;
 
             // Append user outfit as plain text
@@ -783,8 +1115,16 @@ function renderHUD() {
             }
 
             h += '<div class="st-hud-char"><span class="st-hud-char-name">' + esc(c.name) + ':</span> ' + esc(hudStateText) + '</div>';
+
+            // Custom tracked fields for this character
+            if (settings.customFields && settings.customFields.length > 0 && storyData.custom && storyData.custom[c.name]) {
+                var fieldLabelsHud = {};
+                settings.customFields.forEach(function (f) { fieldLabelsHud[f.id] = f.label; });
+                var custVals = storyData.custom[c.name];
+                var custParts = Object.keys(custVals).map(function (k) { return (fieldLabelsHud[k] || k) + ": " + custVals[k]; });
+                if (custParts.length > 0) h += '<div class="st-hud-outfit">' + esc(custParts.join(" · ")) + '</div>';
+            }
         });
-        if (storyData.characters.length > 3) h += '<div style="font-size:9px;opacity:0.5;text-align:center;margin-top:2px;">+ ' + (storyData.characters.length - 3) + ' more</div>';
     }
 
     $("#st-hud-body").html(h);
@@ -826,7 +1166,32 @@ function buildSettingsPanel() {
     h += '<hr><div class="da-srow"><label class="checkbox_label"><input type="checkbox" id="st-s-auto"><span>Auto-update LLM Scene</span></label></div>';
     h += '<div class="da-srow"><label><small>Update every N msgs: <span id="st-interval-val"></span></small></label><input type="range" id="st-s-interval" min="1" max="20" step="1"></div>';
     h += '<hr><div class="da-srow"><label class="checkbox_label"><input type="checkbox" id="st-s-inject"><span>Inject Context into Prompt (Reduces Amnesia)</span></label></div>';
+    h += '<div class="da-srow"><label class="checkbox_label"><input type="checkbox" id="st-s-broadcast"><span>Broadcast scene changes to other extensions</span></label></div>';
     h += '<div class="da-srow"><label class="checkbox_label"><input type="checkbox" id="st-s-cityctry"><span>Show City / Country (LLM infers or invents)</span></label></div>';
+
+    // --- Custom Tracking Fields section ---
+    h += '<hr><div class="da-srow"><label><b><i class="fa-solid fa-sliders"></i> Custom Tracking Fields</b></label></div>';
+    h += '<div class="da-srow"><small style="opacity:.7">Define your own per-character parameters (e.g. "Emotional State", "Growth Level"). The LLM will update them alongside time/location/events every analysis.</small></div>';
+    h += '<div class="da-srow" id="st-custom-fields-list"></div>';
+    h += '<div class="da-srow" style="display:flex;gap:5px;align-items:center;">';
+    h += '<input type="text" id="st-cf-label" class="text_pole" placeholder="Field name (e.g. Emotional State)" style="flex:1">';
+    h += '</div>';
+    h += '<div class="da-srow" style="display:flex;gap:5px;align-items:center;">';
+    h += '<input type="text" id="st-cf-hint" class="text_pole" placeholder="Optional hint for the LLM (e.g. \'one word: happy, angry, sad...\')" style="flex:1">';
+    h += '<button class="menu_button" id="st-cf-add" style="flex:0 0 auto;"><i class="fa-solid fa-plus"></i> Add</button>';
+    h += '</div>';
+
+    // --- Custom Field Presets ---
+    h += '<div class="da-srow" style="margin-top:4px;"><small style="opacity:.7"><i class="fa-solid fa-box-archive"></i> Presets — save the current field set and reuse it in other chats.</small></div>';
+    h += '<div class="da-srow" style="display:flex;gap:5px;align-items:center;">';
+    h += '<select id="st-cf-preset" class="text_pole" style="flex:1"></select>';
+    h += '<button class="menu_button" id="st-cf-preset-load" title="Load preset (replaces current fields)" style="flex:0 0 auto;"><i class="fa-solid fa-download"></i></button>';
+    h += '<button class="menu_button" id="st-cf-preset-del" title="Delete selected preset" style="flex:0 0 auto;"><i class="fa-solid fa-trash"></i></button>';
+    h += '</div>';
+    h += '<div class="da-srow" style="display:flex;gap:5px;align-items:center;">';
+    h += '<input type="text" id="st-cf-preset-name" class="text_pole" placeholder="Preset name (e.g. RPG Stats)" style="flex:1">';
+    h += '<button class="menu_button" id="st-cf-preset-save" style="flex:0 0 auto;"><i class="fa-solid fa-floppy-disk"></i> Save</button>';
+    h += '</div>';
 
     // --- Connection Profile section ---
     h += '<hr><div class="da-srow"><label class="checkbox_label"><input type="checkbox" id="st-s-useprofile"><span>Use a separate Connection Profile for analysis</span></label></div>';
@@ -869,7 +1234,41 @@ function buildSettingsPanel() {
     $("#st-interval-val").text(settings.autoUpdateInterval);
     
     $("#st-s-inject").prop("checked", settings.injectToContext).on("change", function() { settings.injectToContext = this.checked; save(); });
+    $("#st-s-broadcast").prop("checked", settings.broadcastScene).on("change", function() { settings.broadcastScene = this.checked; save(); });
     $("#st-s-cityctry").prop("checked", settings.showCityCountry).on("change", function() { settings.showCityCountry = this.checked; save(); renderModal(); renderHUD(); });
+
+    // --- Custom Tracking Fields ---
+    renderCustomFieldsList();
+    $("#st-cf-add").on("click", function() {
+        var label = $("#st-cf-label").val().trim();
+        var hint = $("#st-cf-hint").val().trim();
+        if (!label) { if (typeof toastr !== "undefined") toastr.warning("Enter a field name first."); return; }
+        addCustomField(label, hint);
+        $("#st-cf-label").val(""); $("#st-cf-hint").val("");
+    });
+
+    // --- Custom Field Presets controls ---
+    renderPresetDropdown();
+    $("#st-cf-preset-save").on("click", function () {
+        var name = $("#st-cf-preset-name").val().trim();
+        if (!name) { if (typeof toastr !== "undefined") toastr.warning("Enter a preset name first."); return; }
+        if (!settings.customFields || settings.customFields.length === 0) {
+            if (typeof toastr !== "undefined") toastr.warning("No custom fields to save into a preset.");
+            return;
+        }
+        saveCurrentAsPreset(name);
+        $("#st-cf-preset-name").val("");
+    });
+    $("#st-cf-preset-load").on("click", function () {
+        var name = $("#st-cf-preset").val();
+        if (!name) { if (typeof toastr !== "undefined") toastr.warning("Select a preset to load."); return; }
+        loadPreset(name);
+    });
+    $("#st-cf-preset-del").on("click", function () {
+        var name = $("#st-cf-preset").val();
+        if (!name) { if (typeof toastr !== "undefined") toastr.warning("Select a preset to delete."); return; }
+        deletePreset(name);
+    });
 
     // --- Connection Profile controls ---
     $("#st-s-useprofile").prop("checked", settings.useConnectionProfile).on("change", function() {
@@ -889,6 +1288,104 @@ function buildSettingsPanel() {
     $("#st-s-open").on("click", function() { loadStoryData(); renderModal(); $("#st-modal").fadeIn(150); });
 }
 
+// --- Custom Tracking Fields management ---
+function slugifyFieldId(label) {
+    var base = String(label).toLowerCase()
+        .replace(/[^a-z0-9а-яё]+/gi, "_")
+        .replace(/^_+|_+$/g, "");
+    if (!base) base = "field";
+    var id = base, n = 1;
+    var existing = (settings.customFields || []).map(function (f) { return f.id; });
+    while (existing.indexOf(id) !== -1) { id = base + "_" + (++n); }
+    return id;
+}
+
+function addCustomField(label, hint) {
+    if (!settings.customFields) settings.customFields = [];
+    settings.customFields.push({ id: slugifyFieldId(label), label: label, hint: hint || "" });
+    save();
+    renderCustomFieldsList();
+    renderModal(); renderHUD();
+}
+
+function removeCustomField(id) {
+    settings.customFields = (settings.customFields || []).filter(function (f) { return f.id !== id; });
+    save();
+    renderCustomFieldsList();
+    renderModal(); renderHUD();
+}
+
+function renderCustomFieldsList() {
+    var $list = $("#st-custom-fields-list");
+    if (!$list.length) return;
+    var fields = settings.customFields || [];
+    if (fields.length === 0) {
+        $list.html('<small style="opacity:.5">No custom fields yet — add one below.</small>');
+        return;
+    }
+    var h = "";
+    fields.forEach(function (f) {
+        h += '<div style="display:flex;align-items:center;gap:6px;padding:4px 0;border-bottom:1px solid rgba(255,255,255,.05);">';
+        h += '<div style="flex:1;"><b>' + esc(f.label) + '</b>' + (f.hint ? ' <small style="opacity:.5">— ' + esc(f.hint) + '</small>' : '') + '</div>';
+        h += '<button class="menu_button st-cf-remove" data-id="' + esc(f.id) + '" title="Remove"><i class="fa-solid fa-trash"></i></button>';
+        h += '</div>';
+    });
+    $list.html(h);
+    $list.find(".st-cf-remove").on("click", function () { removeCustomField($(this).data("id")); });
+}
+
+// --- Custom Field Presets management ---
+// A preset is a named snapshot of settings.customFields, stored globally so it can
+// be reused across chats/scenarios (e.g. "RPG Stats", "Romance").
+function renderPresetDropdown() {
+    var $sel = $("#st-cf-preset");
+    if (!$sel.length) return;
+    var presets = settings.customFieldPresets || [];
+    var prev = $sel.val();
+    var html = '<option value="">— Saved presets —</option>';
+    presets.forEach(function (p) {
+        if (!p || !p.name) return;
+        var n = (p.fields || []).length;
+        html += '<option value="' + esc(p.name) + '">' + esc(p.name) + ' (' + n + ')</option>';
+    });
+    $sel.html(html);
+    // Keep the previous selection if it still exists.
+    if (prev && presets.some(function (p) { return p.name === prev; })) $sel.val(prev);
+}
+
+function saveCurrentAsPreset(name) {
+    if (!settings.customFieldPresets) settings.customFieldPresets = [];
+    var fields = JSON.parse(JSON.stringify(settings.customFields || []));
+    var existing = settings.customFieldPresets.find(function (p) { return p.name === name; });
+    if (existing) {
+        existing.fields = fields;   // same name → update the preset in place
+    } else {
+        settings.customFieldPresets.push({ name: name, fields: fields });
+    }
+    save();
+    renderPresetDropdown();
+    $("#st-cf-preset").val(name);
+    if (typeof toastr !== "undefined") toastr.success(existing ? 'Preset "' + name + '" updated.' : 'Preset "' + name + '" saved.');
+}
+
+function loadPreset(name) {
+    var preset = (settings.customFieldPresets || []).find(function (p) { return p.name === name; });
+    if (!preset) return;
+    settings.customFields = JSON.parse(JSON.stringify(preset.fields || []));
+    save();
+    renderCustomFieldsList();
+    renderModal(); renderHUD();
+    if (typeof toastr !== "undefined") toastr.success('Loaded preset "' + name + '".');
+}
+
+function deletePreset(name) {
+    settings.customFieldPresets = (settings.customFieldPresets || []).filter(function (p) { return p.name !== name; });
+    save();
+    renderPresetDropdown();
+    $("#st-cf-preset").val("");
+    if (typeof toastr !== "undefined") toastr.info('Preset "' + name + '" deleted.');
+}
+
 // --- Translation ---
 async function initTranslation() {
     try {
@@ -897,10 +1394,44 @@ async function initTranslation() {
     } catch (e) {}
 }
 
+/* ── §9.2: window.RPGLang, the ecosystem's language layer ──────────
+   Used when it is there (one language knob, one shared cache, a translate call
+   that can no longer come back undefined), local path kept for standalone. */
+function stLangApi() {
+    try { return (typeof window !== "undefined" && window.RPGLang) ? window.RPGLang : null; } catch (e) { return null; }
+}
+
+function getTargetLang() {
+    var api = stLangApi();
+    try { if (api && typeof api.mtTarget === "function") { var c = api.mtTarget(); if (c) return c; } } catch (e) {}
+    return (extSettings && extSettings.translate && extSettings.translate.target_language) ? extSettings.translate.target_language : "ru";
+}
+
 async function tr(text) {
-    if (!translateFn || !text || !text.trim()) return text;
-    let target = (extSettings && extSettings.translate && extSettings.translate.target_language) ? extSettings.translate.target_language : "ru";
-    return await translateFn(text, target);
+    if (!text || !text.trim()) return text;
+    var api = stLangApi();
+    if (api && typeof api.mt === "function") return await api.mt(text, { lang: getTargetLang() });
+    if (!translateFn) return text;
+    return await translateFn(text, getTargetLang());
+}
+
+/* A language switch must find the data in its ORIGINAL language: translateData()
+   guards on _translated and would otherwise snapshot already-translated text as
+   the original, losing the source language for good. */
+function stBindLangSwitch() {
+    var api = stLangApi();
+    if (!api || typeof api.onBeforeChange !== "function") {
+        /* Character Library publishes window.RPGLang at loading_order 21 —
+           later than this extension — so the first attempt finds nothing. It
+           fires 'rpglang:ready' when the facade exists; retry once. */
+        try { document.addEventListener("rpglang:ready", function () { stBindLangSwitch(); }, { once: true }); } catch (e) {}
+        return;
+    }
+    api.onBeforeChange(function () {
+        try {
+            if (storyData && storyData._translated) { untranslateData(); renderModal(); renderHUD(); syncTranslateBtn(); }
+        } catch (e) { console.warn("[Story Tracker] lang switch:", e); }
+    });
 }
 
 async function translateData() {
@@ -909,15 +1440,18 @@ async function translateData() {
     storyData._origLocation = storyData.location;
     storyData._origEvents = storyData.recent_events;
     storyData._origWeather = storyData.weather;
+    storyData._origDayOfWeek = storyData.day_of_week;
     storyData._origTemperature = storyData.temperature;
     storyData._origCity = storyData.city;
     storyData._origCountry = storyData.country;
     storyData._origCharacters = JSON.parse(JSON.stringify(storyData.characters));
     storyData._origHistory = JSON.parse(JSON.stringify(storyData.history));
+    storyData._origCustom = JSON.parse(JSON.stringify(storyData.custom || {}));
     
     if (storyData.location) storyData.location = await tr(storyData.location);
     if (storyData.recent_events) storyData.recent_events = await tr(storyData.recent_events);
     if (storyData.weather && storyData.weather !== "Unknown") storyData.weather = await tr(storyData.weather);
+    if (storyData.day_of_week && storyData.day_of_week !== "Unknown") storyData.day_of_week = await tr(storyData.day_of_week);
     if (storyData.city && storyData.city !== "Unknown") storyData.city = await tr(storyData.city);
     if (storyData.country && storyData.country !== "Unknown") storyData.country = await tr(storyData.country);
     
@@ -934,6 +1468,16 @@ async function translateData() {
             if (h.events) h.events = await tr(h.events);
         }
     }
+
+    if (storyData.custom) {
+        for (let charName in storyData.custom) {
+            let vals = storyData.custom[charName];
+            if (!vals || typeof vals !== "object") continue;
+            for (let key in vals) {
+                if (vals[key] && typeof vals[key] === "string") vals[key] = await tr(vals[key]);
+            }
+        }
+    }
     
     storyData._translated = true;
     saveStoryData();
@@ -945,21 +1489,25 @@ function untranslateData() {
     if (storyData._origLocation) storyData.location = storyData._origLocation;
     if (storyData._origEvents) storyData.recent_events = storyData._origEvents;
     if (storyData._origWeather) storyData.weather = storyData._origWeather;
+    if (storyData._origDayOfWeek) storyData.day_of_week = storyData._origDayOfWeek;
     if (storyData._origTemperature) storyData.temperature = storyData._origTemperature;
     if (storyData._origCity) storyData.city = storyData._origCity;
     if (storyData._origCountry) storyData.country = storyData._origCountry;
     if (storyData._origCharacters) storyData.characters = JSON.parse(JSON.stringify(storyData._origCharacters));
     if (storyData._origHistory) storyData.history = JSON.parse(JSON.stringify(storyData._origHistory));
+    if (storyData._origCustom) storyData.custom = JSON.parse(JSON.stringify(storyData._origCustom));
     
     delete storyData._translated; 
     delete storyData._origLocation; 
     delete storyData._origEvents; 
     delete storyData._origWeather;
+    delete storyData._origDayOfWeek;
     delete storyData._origTemperature;
     delete storyData._origCity;
     delete storyData._origCountry;
     delete storyData._origCharacters;
     delete storyData._origHistory;
+    delete storyData._origCustom;
     
     saveStoryData();
 }
@@ -979,6 +1527,156 @@ async function doTranslateToggle() {
     
     busy = false; $b.prop("disabled", false);
     syncTranslateBtn();
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   PUBLIC API — window.StoryTrackerAPI (GM Turn §9.1, layer GM-C)
+
+   The Game Shell can now get the scene out of the MAIN generation (one
+   <gm> block appended to the reply) instead of paying for this extension's
+   own quiet analysis every few messages. That data has to land here, and the
+   only safe way in is a narrow API: every helper below is module-private.
+
+   Why this is NOT "call doLLMUpdate's apply block with a different source":
+   that block ASSIGNS unconditionally — `storyData.custom = (data.custom && …)
+   ? data.custom : {}` and `storyData.characters = Array.isArray(...) ? ... : []`.
+   Fed a partial GM payload it would erase the user's custom fields and empty
+   the presence roster on the first turn. applyScene therefore merges: a field
+   the block did not mention keeps its old value, and `custom` is never touched
+   from outside at all.
+
+   The history entry lives in applyHistory, not here: the Shell applies the
+   scene on every swipe (display tier) but commits history exactly once per
+   turn (commit tier) — history.unshift on each swipe would pile up alternate
+   timelines that later get injected into the prompt as fact.
+   ═══════════════════════════════════════════════════════════════ */
+
+var ST_API_VERSION = "1.3.0";   /* 2026-08-02: stands down when the host owns the scene; the city/country fallback asks once per place */
+
+function stApiBlank(v) { return !v || String(v).trim() === "" || String(v).trim().toLowerCase() === "unknown"; }
+
+function stApiEnsureData() {
+    if (!storyData) { try { loadStoryData(); } catch (e) { } }
+    return storyData;
+}
+
+/* Values arriving through the API are already in the player's language — no
+   translation happened. When the panel is currently showing a translation, the
+   matching _orig* snapshot must move with the value, or "Show Original" would
+   restore pre-GM text and injectContextToChat (which prefers _orig*) would
+   feed the model a location the story left three scenes ago. */
+function stApiSet(field, origField, value) {
+    storyData[field] = value;
+    if (storyData._translated && origField) storyData[origField] = value;
+}
+
+function installStoryTrackerApi() {
+    var api = {
+        version: ST_API_VERSION,
+        isAvailable: function () { return !!(scriptModule && settings && settings.enabled); },
+
+        /* Deep copy: callers snapshot this before applying a payload so a swipe
+           can put the scene back exactly as it was. */
+        getScene: function () {
+            var sd = stApiEnsureData();
+            if (!sd) return null;
+            try {
+                return JSON.parse(JSON.stringify({
+                    time: sd.time, date: sd.date, location: sd.location,
+                    city: sd.city, country: sd.country,
+                    temperature: sd.temperature, weather: sd.weather,
+                    characters: sd.characters || [], recent_events: sd.recent_events || "",
+                    _initialized: !!sd._initialized
+                }));
+            } catch (e) { return null; }
+        },
+
+        /* Merge-only scene update. Returns the list of fields that changed.
+           opts.replace — restore mode (GM Turn swipe rollback): every key the
+           caller passes wins, even an empty one. A merge cannot undo a payload,
+           because the fields it introduced are exactly the ones the snapshot
+           has empty.
+           opts.silent (v1.1) — do not broadcast ST_SCENE_EVENT. For a caller
+           that is not REPORTING a scene change but RECORDING one it already
+           announced itself: Lore World writes the place it just travelled to,
+           and re-broadcasting it would hand its own move back to every listener
+           as fresh news — including the listeners that answer news with an LLM
+           call. Silence here is not a lost signal; it is the absence of an
+           echo. */
+        applyScene: function (d, opts) {
+            var out = { applied: [], ok: false };
+            var sd = stApiEnsureData();
+            if (!sd || !d || typeof d !== "object") return out;
+            var replace = !!(opts && opts.replace);
+            var has = function (k) { return replace && Object.prototype.hasOwnProperty.call(d, k); };
+            try {
+                /* snapshot BEFORE the write — the broadcast compares old vs new */
+                var prevScene = { initialized: !!sd._initialized, location: sd.location, date: sd.date };
+
+                if (d.time || has("time")) { stApiSet("time", null, String(d.time || "")); out.applied.push("time"); }
+                if (d.date || has("date")) { stApiSet("date", null, String(d.date || "")); out.applied.push("date"); }
+                if (d.location || has("location")) { stApiSet("location", "_origLocation", String(d.location || "")); out.applied.push("location"); }
+                if (!stApiBlank(d.city) || has("city")) { stApiSet("city", "_origCity", String(d.city || "")); out.applied.push("city"); }
+                if (!stApiBlank(d.country) || has("country")) { stApiSet("country", "_origCountry", String(d.country || "")); out.applied.push("country"); }
+                if (d.temperature || has("temperature")) { stApiSet("temperature", "_origTemperature", String(d.temperature || "")); out.applied.push("temperature"); }
+                if (d.weather || has("weather")) { stApiSet("weather", "_origWeather", String(d.weather || "")); out.applied.push("weather"); }
+                if (replace && Array.isArray(d.characters)) {
+                    storyData.characters = JSON.parse(JSON.stringify(d.characters));
+                    if (storyData._translated) storyData._origCharacters = JSON.parse(JSON.stringify(d.characters));
+                    out.applied.push("characters");
+                } else if (Array.isArray(d.characters) && d.characters.length) {
+                    var list = d.characters.map(function (c) {
+                        if (typeof c === "string") return { name: c, state: "" };
+                        return { name: String((c && c.name) || ""), state: String((c && c.state) || "") };
+                    }).filter(function (c) { return c.name; });
+                    if (list.length) {
+                        storyData.characters = list;
+                        if (storyData._translated) storyData._origCharacters = JSON.parse(JSON.stringify(list));
+                        out.applied.push("characters");
+                    }
+                }
+                if (d.recent_events || has("recent_events")) { stApiSet("recent_events", "_origEvents", String(d.recent_events || "")); out.applied.push("recent_events"); }
+                /* storyData.custom belongs to the user's custom fields — the GM
+                   block has no such key and must never be able to clear it. */
+
+                if (stApiBlank(storyData.city)) storyData.city = "Unknown";
+                if (stApiBlank(storyData.country)) storyData.country = "Unknown";
+                storyData._initialized = true;
+
+                if (!out.applied.length) return out;
+                saveStoryData();
+                syncToCharTracker();
+                if (!(opts && opts.silent)) maybeEmitSceneChange(prevScene);
+                try { renderModal(); renderHUD(); } catch (e) { }
+                if (settings.enabled && settings.injectToContext) { try { injectContextToChat(); } catch (e) { } }
+                out.ok = true;
+            } catch (e) { console.warn("[Story Tracker] applyScene:", e); }
+            return out;
+        },
+
+        /* Commit tier: one history entry per turn, same shape doLLMUpdate writes. */
+        applyHistory: function (d) {
+            var sd = stApiEnsureData();
+            if (!sd) return false;
+            try {
+                if (!Array.isArray(sd.history)) sd.history = [];
+                sd.history.unshift({
+                    msg: msgCounter,
+                    time: sd.time, loc: sd.location,
+                    temperature: sd.temperature, weather: sd.weather,
+                    events: (d && d.recent_events) || sd.recent_events || "",
+                    chars: JSON.parse(JSON.stringify(sd.characters || [])),
+                    custom: JSON.parse(JSON.stringify(sd.custom || {}))
+                });
+                if (sd.history.length > 20) sd.history.pop();
+                saveStoryData();
+                try { renderModal(); } catch (e) { }
+                return true;
+            } catch (e) { console.warn("[Story Tracker] applyHistory:", e); return false; }
+        }
+    };
+    try { if (typeof window !== "undefined") window.StoryTrackerAPI = api; } catch (e) { }
+    try { if (typeof globalThis !== "undefined") globalThis.StoryTrackerAPI = api; } catch (e) { }
 }
 
 function syncTranslateBtn() {
