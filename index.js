@@ -1469,16 +1469,32 @@ async function translateData() {
         }
     }
 
+    /* storyData.custom is keyed by character name. The HUD/modal look it up as
+       storyData.custom[c.name] against the now-translated storyData.characters,
+       so the keys must follow the same rename or every lookup misses and the
+       custom fields section silently vanishes post-translate. _origCharacters
+       was snapshotted above, before translation, so index-pairing it against
+       the now-translated storyData.characters gives the old->new name map. */
     if (storyData.custom) {
-        for (let charName in storyData.custom) {
-            let vals = storyData.custom[charName];
-            if (!vals || typeof vals !== "object") continue;
-            for (let key in vals) {
-                if (vals[key] && typeof vals[key] === "string") vals[key] = await tr(vals[key]);
+        var stNameMap = {};
+        if (storyData._origCharacters && storyData.characters) {
+            for (let i = 0; i < storyData._origCharacters.length && i < storyData.characters.length; i++) {
+                stNameMap[storyData._origCharacters[i].name] = storyData.characters[i].name;
             }
         }
+        var stTranslatedCustom = {};
+        for (let charName in storyData.custom) {
+            let vals = storyData.custom[charName];
+            if (vals && typeof vals === "object") {
+                for (let key in vals) {
+                    if (vals[key] && typeof vals[key] === "string") vals[key] = await tr(vals[key]);
+                }
+            }
+            stTranslatedCustom[stNameMap[charName] || charName] = vals;
+        }
+        storyData.custom = stTranslatedCustom;
     }
-    
+
     storyData._translated = true;
     saveStoryData();
 }

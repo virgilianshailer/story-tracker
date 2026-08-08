@@ -6,6 +6,6 @@
     "js": "index.js",
     "css": "style.css",
     "author": "User",
-    "version": "1.9.1",
+    "version": "1.9.2",
     "description": "Tracks time, location, character positions, and recent events to maintain narrative consistency."
 }
