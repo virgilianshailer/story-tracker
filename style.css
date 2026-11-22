@@ -141,6 +141,84 @@
     border-radius:4px; margin-top:3px; border-left:2px solid #7ab8d4;
 }
 
+/* ══════════════════════════════════════
+   VISUALIZE — the eye, the thumbnail, the lightbox
+   The eye sits at the END of the entry it belongs to, inline with the text, so
+   it wraps with the sentence instead of pinning itself to a corner the text
+   has already left.
+   ══════════════════════════════════════ */
+.st-viz-eye {
+    display:inline-block; margin-left:6px; cursor:pointer;
+    font-size:11px; color:#ffa064; opacity:.55; vertical-align:baseline;
+    transition:opacity .15s, transform .15s;
+}
+.st-viz-eye:hover { opacity:1; transform:scale(1.2); }
+.st-viz-eye.st-viz-done { opacity:.95; color:#7ab8d4; }
+.st-char-name .st-viz-eye { font-size:12px; }
+
+.st-viz-status {
+    font-size:10px; opacity:.7; margin-top:4px; padding:3px 5px;
+    border-left:2px solid #7ab8d4; background:rgba(0,0,0,.2); border-radius:4px;
+}
+.st-viz-thumb { margin-top:5px; cursor:zoom-in; line-height:0; }
+.st-viz-thumb img {
+    width:100%; max-height:150px; object-fit:cover; display:block;
+    border-radius:5px; border:1px solid rgba(255,160,100,.25);
+}
+.st-viz-thumb:hover img { border-color:rgba(255,160,100,.7); }
+
+#st-viz-box { position:fixed; inset:0; z-index:10001; display:flex; align-items:center; justify-content:center; }
+.st-viz-ovl { position:absolute; inset:0; background:rgba(0,0,0,.8); }
+.st-viz-inner {
+    position:relative; z-index:1; max-width:92vw; max-height:92vh;
+    display:flex; flex-direction:column; gap:8px;
+    background:#141820; border:1px solid rgba(255,160,100,.25);
+    border-radius:8px; padding:10px;
+}
+.st-viz-head { display:flex; align-items:center; gap:8px; font-weight:700; color:#ffa064; }
+.st-viz-head #st-viz-title { flex:1; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.st-viz-hbtn { flex:0 0 auto; }
+.st-viz-11 { min-width:3.2em; font-size:11px; font-weight:700; }
+.st-viz-zoom { flex:0 0 auto; min-width:5.5em; text-align:center; font-size:11px; font-weight:400; opacity:.8; font-variant-numeric:tabular-nums; }
+.st-viz-size { flex:0 0 auto; font-size:11px; font-weight:400; opacity:.5; font-variant-numeric:tabular-nums; }
+
+/* The stage hugs the FITTED picture (v1.13.1): its width and height are set by
+   stVizLayout once the picture's size is known, so a portrait opens in a
+   portrait window. The size below is only what shows before the first picture
+   has decoded. Zoom and pan happen inside this frame; the picture is positioned
+   by transform from the stage's top-left corner — see stVizApplyView. */
+.st-viz-stage {
+    position:relative; overflow:hidden;
+    width:52vh; height:70vh; max-width:100%;
+    flex:0 0 auto; align-self:center;         /* narrower than the header → centred under it */
+    background:#0b0e13; border-radius:6px;
+    cursor:zoom-in; touch-action:none; user-select:none;
+}
+.st-viz-stage.st-viz-zoomed { cursor:grab; }
+.st-viz-stage.st-viz-dragging { cursor:grabbing; }
+#st-viz-img {
+    position:absolute; left:0; top:0;
+    max-width:none; max-height:none;          /* themes cap <img> at 100% — that would fight the transform */
+    transform-origin:0 0; will-change:transform;
+    user-select:none; -webkit-user-drag:none; pointer-events:none;
+}
+/* width:0 + min-width:100% — the prompt takes the window's width but never
+   SETS it: a long one-line prompt used to stretch the window to the screen edge. */
+.st-viz-prompt {
+    font-size:11px; opacity:.6; max-height:15vh; overflow:auto; white-space:pre-wrap;
+    width:0; min-width:100%; flex:0 1 auto; min-height:0;
+}
+
+/* Fold button in the HUD head: pictures shown / folded away. */
+.st-hud-tools { margin-left:auto; display:inline-flex; align-items:center; gap:10px; }
+.st-viz-fold { cursor:pointer; font-size:11px; opacity:.75; transition:opacity .15s, transform .15s; }
+.st-viz-fold:hover { opacity:1; transform:scale(1.15); }
+.st-viz-fold.st-viz-fold-off { opacity:.35; }
+.st-viz-fold.st-viz-fold-off:hover { opacity:.8; }
+
+html[data-rpg-lum] .st-viz-eye { color: var(--rpg-accent, #ffa064); }
+html[data-rpg-lum] .st-viz-inner { background: var(--rpg-panel, #141820); border-color: var(--rpg-accent, #ffa064); }
+
 /* ── Inline Outfit inside Character Cards ── */
 .st-char-inline-outfit {
     margin-top:8px; padding-top:7px;
